@@ -19,8 +19,8 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Установить PyInstaller
-        run: python -m pip install --upgrade pip pyinstaller
+      - name: Установить PyInstaller и pywin32
+        run: python -m pip install --upgrade pip pyinstaller pywin32
 
       - name: Собрать EXE
         run: >
