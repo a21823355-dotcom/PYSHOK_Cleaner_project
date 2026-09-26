@@ -1,0 +1,36 @@
+name: Build PYSHOK Cleaner EXE
+
+# Собирается автоматически при каждой загрузке файлов в репозиторий,
+# а также вручную кнопкой "Run workflow" во вкладке Actions.
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Скачать файлы репозитория
+        uses: actions/checkout@v4
+
+      - name: Установить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Установить PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Собрать EXE
+        run: >
+          python -m PyInstaller --onefile --windowed
+          --name "PYSHOK_Cleaner"
+          --version-file "version_info.txt"
+          cleaner.py
+
+      - name: Загрузить готовый EXE как артефакт
+        uses: actions/upload-artifact@v4
+        with:
+          name: PYSHOK_Cleaner
+          path: dist/PYSHOK_Cleaner.exe
