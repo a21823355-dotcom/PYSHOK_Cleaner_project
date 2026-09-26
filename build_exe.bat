@@ -16,8 +16,8 @@ if errorlevel 1 (
 )
 
 echo.
-echo Установка PyInstaller (если ещё не установлен)...
-python -m pip install --upgrade pyinstaller
+echo Установка PyInstaller и pywin32 (если ещё не установлены)...
+python -m pip install --upgrade pyinstaller pywin32
 
 echo.
 echo Сборка EXE...
