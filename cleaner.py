@@ -2,23 +2,29 @@
 """
 PYSHOK Cleaner PRO
 Разработчик: PYSHOK LAB
-Версия: 2.0.0
+Версия: 2.1.0
 
 Многофункциональная утилита для Windows:
-  - очистка мусора (temp, кэш, корзина, реестр и т.д.)
+  - очистка мусора (temp, кэш, корзина, реестр и т.д.) с оценкой
+    объёма перед очисткой
   - поиск и удаление битых ярлыков и "осиротевших" записей в реестре
   - оптимизация дисков (TRIM для SSD / дефрагментация для HDD)
   - менеджер автозагрузки
+  - менеджер установленных программ (в т.ч. пометка потенциально
+    нежелательных программ)
   - поиск больших файлов
   - интеграция со встроенным Windows Defender (запуск проверки)
   - выбор языка интерфейса (русский/английский)
 
 ВАЖНО:
-  - Программа НЕ является отдельным антивирусом. Писать собственный
-    антивирусный движок с нуля бессмысленно и небезопасно — вместо
-    этого программа запускает проверку уже встроенным в Windows
-    Defender, который обновляется и поддерживается Microsoft.
+  - Программа НЕ является отдельным антивирусом. Свой антивирусный
+    движок с нуля не создаётся — вместо этого запускается проверка
+    уже встроенным в Windows Defender, который поддерживается и
+    обновляется Microsoft.
+  - Все служебные команды выполняются без мелькающих окон консоли.
   - Перед изменением реестра и автозагрузки всегда делается бэкап.
+  - Удаление программ выполняется через их штатный деинсталлятор —
+    так же, как это делает "Установка и удаление программ" в Windows.
   - Требуются права администратора для полноценной работы.
 """
 
@@ -27,7 +33,9 @@ import re
 import sys
 import glob
 import shutil
+import struct
 import ctypes
+import platform
 import threading
 import subprocess
 import time
@@ -41,14 +49,8 @@ try:
 except ImportError:
     winreg = None
 
-try:
-    import win32com.client  # для чтения .lnk-ярлыков (устанавливается сборкой из pywin32)
-    HAS_WIN32COM = True
-except ImportError:
-    HAS_WIN32COM = False
-
 APP_NAME = "PYSHOK Cleaner PRO"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 DEVELOPER = "PYSHOK LAB"
 CONTACT = "8(707)151-29-79 (WhatsApp/Telegram, только текст)"
 
@@ -58,6 +60,10 @@ BG = "#f4f6f5"
 CARD_BG = "#ffffff"
 TEXT_MUTED = "#666666"
 DANGER = "#a03a3a"
+WARN = "#b8860b"
+
+# Флаг, скрывающий мелькание окна консоли при запуске служебных команд
+SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
 
 
 # =============================================================================
@@ -70,18 +76,21 @@ STRINGS = {
         "admin_yes": "Права администратора: ЕСТЬ",
         "admin_no": "Права администратора: НЕТ (часть функций не сработает)",
         "relaunch_admin": "Перезапустить с правами администратора",
-        "about": "О программе",
         "lang_label": "Язык:",
         "tab_clean": "Очистка",
         "tab_disks": "Диски",
         "tab_startup": "Автозагрузка",
+        "tab_programs": "Программы",
         "tab_security": "Безопасность",
         "tab_tools": "Инструменты",
+        "sysinfo_os": "ОС",
+        "sysinfo_ram": "ОЗУ",
+        "sysinfo_scan": "Оценить объём мусора",
+        "sysinfo_scanning": "Идёт оценка...",
         "clean_what": "Что очистить",
         "select_all": "Выбрать всё",
         "select_none": "Снять всё",
         "start_clean": "Начать очистку",
-        "cleaning_running": "Идёт очистка...",
         "opt_temp": "Временные файлы пользователя (%TEMP%)",
         "opt_wintemp": "Системная папка Windows\\Temp",
         "opt_prefetch": "Prefetch (кэш запуска программ)",
@@ -105,20 +114,27 @@ STRINGS = {
         "disks_col_drive": "Диск",
         "disks_col_type": "Тип",
         "disks_col_free": "Свободно",
-        "disks_col_status": "Статус",
         "disks_optimize": "Оптимизировать выбранный",
         "disks_optimize_all": "Оптимизировать все",
         "disks_optimizing": "Оптимизация {drive}...",
-        "disks_note": "Для SSD выполняется TRIM, для HDD — дефрагментация. Это безопасные штатные функции Windows.",
+        "disks_note": "Для SSD выполняется TRIM, для HDD — дефрагментация. Это штатные функции Windows.",
         "startup_title": "Программы в автозагрузке",
         "startup_refresh": "Обновить список",
         "startup_col_name": "Название",
         "startup_col_cmd": "Команда / путь",
         "startup_col_src": "Источник",
         "startup_remove": "Удалить выбранное (с бэкапом)",
-        "startup_note": "Перед удалением автоматически создаётся резервная копия в Документы\\PYSHOK_Cleaner_Backups.",
+        "startup_note": "Перед удалением создаётся резервная копия в Документы\\PYSHOK_Cleaner_Backups. Красным — подозрительные записи.",
+        "programs_title": "Установленные программы",
+        "programs_refresh": "Обновить список",
+        "programs_col_name": "Название",
+        "programs_col_publisher": "Издатель",
+        "programs_col_size": "Размер",
+        "programs_uninstall": "Удалить выбранные",
+        "programs_note": "Красным помечены программы, которые часто относят к нежелательным (тулбары, рекламный софт). Удаление запускает штатный деинсталлятор программы — так же, как в 'Установка и удаление программ'.",
+        "programs_confirm": "Будет запущен деинсталлятор для {n} программ(ы). Продолжить?",
         "security_title": "Безопасность",
-        "security_disclaimer": "PYSHOK Cleaner не заменяет антивирус. Кнопки ниже запускают проверку встроенным Windows Defender.",
+        "security_disclaimer": "PYSHOK Cleaner не заменяет антивирус. Кнопки ниже запускают проверку встроенным Windows Defender — самым надёжным вариантом, так как он постоянно обновляется Microsoft.",
         "security_status": "Статус Defender:",
         "security_status_unknown": "не удалось получить статус",
         "security_quick_scan": "Быстрая проверка",
@@ -134,7 +150,8 @@ STRINGS = {
         "tools_shortcuts_remove": "Удалить выбранные",
         "tools_shortcuts_col_name": "Ярлык",
         "tools_shortcuts_col_target": "Отсутствующая цель",
-        "tools_shortcuts_none": "Нужен модуль pywin32 (уже встроен в exe) для чтения ярлыков.",
+        "tools_shortcuts_scanning": "Поиск...",
+        "tools_shortcuts_result": "Найдено битых ярлыков: {n}",
         "tools_bigfiles": "Поиск больших файлов",
         "tools_bigfiles_folder": "Папка:",
         "tools_bigfiles_choose": "Выбрать...",
@@ -146,26 +163,29 @@ STRINGS = {
         "confirm_delete_title": "Подтверждение",
         "confirm_delete_body": "Удалить выбранные элементы ({n} шт.)? Действие нельзя отменить.",
         "nothing_selected": "Ничего не выбрано.",
-        "done": "Готово",
         "admin_required": "Для этой функции нужны права администратора.",
+        "error_prefix": "ОШИБКА",
     },
     "en": {
         "app_title": "{app} {ver} — {dev}",
         "admin_yes": "Administrator rights: YES",
         "admin_no": "Administrator rights: NO (some features won't work)",
         "relaunch_admin": "Restart as administrator",
-        "about": "About",
         "lang_label": "Language:",
         "tab_clean": "Cleanup",
         "tab_disks": "Disks",
         "tab_startup": "Startup",
+        "tab_programs": "Programs",
         "tab_security": "Security",
         "tab_tools": "Tools",
+        "sysinfo_os": "OS",
+        "sysinfo_ram": "RAM",
+        "sysinfo_scan": "Estimate junk size",
+        "sysinfo_scanning": "Estimating...",
         "clean_what": "What to clean",
         "select_all": "Select all",
         "select_none": "Select none",
         "start_clean": "Start cleaning",
-        "cleaning_running": "Cleaning in progress...",
         "opt_temp": "User temp files (%TEMP%)",
         "opt_wintemp": "System folder Windows\\Temp",
         "opt_prefetch": "Prefetch (app launch cache)",
@@ -189,20 +209,27 @@ STRINGS = {
         "disks_col_drive": "Drive",
         "disks_col_type": "Type",
         "disks_col_free": "Free space",
-        "disks_col_status": "Status",
         "disks_optimize": "Optimize selected",
         "disks_optimize_all": "Optimize all",
         "disks_optimizing": "Optimizing {drive}...",
-        "disks_note": "SSDs get TRIM, HDDs get defragmented. These are safe built-in Windows features.",
+        "disks_note": "SSDs get TRIM, HDDs get defragmented. These are built-in Windows features.",
         "startup_title": "Startup programs",
         "startup_refresh": "Refresh list",
         "startup_col_name": "Name",
         "startup_col_cmd": "Command / path",
         "startup_col_src": "Source",
         "startup_remove": "Remove selected (with backup)",
-        "startup_note": "A backup is created automatically in Documents\\PYSHOK_Cleaner_Backups before removal.",
+        "startup_note": "A backup is created in Documents\\PYSHOK_Cleaner_Backups. Red = suspicious entries.",
+        "programs_title": "Installed programs",
+        "programs_refresh": "Refresh list",
+        "programs_col_name": "Name",
+        "programs_col_publisher": "Publisher",
+        "programs_col_size": "Size",
+        "programs_uninstall": "Uninstall selected",
+        "programs_note": "Red marks programs often considered unwanted (toolbars, adware). Removal launches the program's own uninstaller, same as 'Programs and Features'.",
+        "programs_confirm": "This will launch the uninstaller for {n} program(s). Continue?",
         "security_title": "Security",
-        "security_disclaimer": "PYSHOK Cleaner does not replace antivirus software. The buttons below trigger a scan using built-in Windows Defender.",
+        "security_disclaimer": "PYSHOK Cleaner does not replace antivirus software. The buttons below trigger a scan using built-in Windows Defender — the most reliable option since it's kept updated by Microsoft.",
         "security_status": "Defender status:",
         "security_status_unknown": "status unavailable",
         "security_quick_scan": "Quick scan",
@@ -218,7 +245,8 @@ STRINGS = {
         "tools_shortcuts_remove": "Remove selected",
         "tools_shortcuts_col_name": "Shortcut",
         "tools_shortcuts_col_target": "Missing target",
-        "tools_shortcuts_none": "The pywin32 module (bundled in the exe) is needed to read shortcuts.",
+        "tools_shortcuts_scanning": "Scanning...",
+        "tools_shortcuts_result": "Broken shortcuts found: {n}",
         "tools_bigfiles": "Find large files",
         "tools_bigfiles_folder": "Folder:",
         "tools_bigfiles_choose": "Choose...",
@@ -230,8 +258,8 @@ STRINGS = {
         "confirm_delete_title": "Confirm",
         "confirm_delete_body": "Delete selected items ({n})? This cannot be undone.",
         "nothing_selected": "Nothing selected.",
-        "done": "Done",
         "admin_required": "This feature requires administrator rights.",
+        "error_prefix": "ERROR",
     },
 }
 LANG = {"code": "ru"}
@@ -283,6 +311,8 @@ def format_size(num_bytes):
 
 
 def get_size(path):
+    if not path:
+        return 0
     if os.path.isfile(path):
         try:
             return os.path.getsize(path)
@@ -320,16 +350,22 @@ def clear_folder_contents(path, log):
     return freed, removed, skipped
 
 
-def run_powershell(cmd, timeout=180):
-    """Выполняет команду PowerShell и возвращает (returncode, stdout, stderr)."""
+def run_hidden(args, timeout=60):
+    """subprocess.run без мелькающего окна консоли."""
     try:
-        p = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-            capture_output=True, text=True, timeout=timeout,
-        )
-        return p.returncode, p.stdout, p.stderr
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout,
+                               creationflags=SUBPROCESS_FLAGS)
     except Exception as e:
-        return -1, "", str(e)
+        class _R:
+            returncode = -1
+            stdout = ""
+            stderr = str(e)
+        return _R()
+
+
+def run_powershell(cmd, timeout=180):
+    p = run_hidden(["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd], timeout=timeout)
+    return p.returncode, p.stdout or "", p.stderr or ""
 
 
 REG_BACKUP_DIR_NAME = "PYSHOK_Cleaner_Backups"
@@ -345,14 +381,23 @@ def backup_registry_key(hive_name, subkey, log, label):
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_file = os.path.join(backup_dir(), f"{label}_{stamp}.reg")
     full_path = f"{hive_name}\\{subkey}" if subkey else hive_name
-    try:
-        subprocess.run(["reg", "export", full_path, backup_file, "/y"],
-                        capture_output=True, timeout=60, check=True)
+    p = run_hidden(["reg", "export", full_path, backup_file, "/y"], timeout=60)
+    if p.returncode == 0:
         log(f"  backup: {backup_file}")
         return backup_file
-    except Exception as e:
-        log(f"  backup FAILED: {e}")
-        return None
+    log(f"  backup FAILED")
+    return None
+
+
+def safe_thread(target, log_fn=None):
+    """Оборачивает функцию потока так, чтобы исключение не терялось молча."""
+    def wrapper(*args, **kwargs):
+        try:
+            target(*args, **kwargs)
+        except Exception as e:
+            if log_fn:
+                log_fn(f"{t('error_prefix')}: {e}")
+    return wrapper
 
 
 # =============================================================================
@@ -397,15 +442,9 @@ def task_recycle_bin(log):
 
 def task_windows_update_cache(log):
     log(t("opt_wu") + "...")
-    try:
-        subprocess.run(["net", "stop", "wuauserv"], capture_output=True, timeout=30)
-    except Exception:
-        pass
+    run_hidden(["net", "stop", "wuauserv"], timeout=30)
     freed, _, _ = clear_folder_contents(r"C:\Windows\SoftwareDistribution\Download", log)
-    try:
-        subprocess.run(["net", "start", "wuauserv"], capture_output=True, timeout=30)
-    except Exception:
-        pass
+    run_hidden(["net", "start", "wuauserv"], timeout=30)
     log(f"  {format_size(freed)}")
     return freed
 
@@ -467,10 +506,7 @@ def task_browser_cache(log):
 
 def task_font_cache(log):
     log(t("opt_fontcache") + "...")
-    try:
-        subprocess.run(["net", "stop", "FontCache"], capture_output=True, timeout=20)
-    except Exception:
-        pass
+    run_hidden(["net", "stop", "FontCache"], timeout=20)
     freed = 0
     local = os.environ.get("LOCALAPPDATA", "")
     p = os.path.join(local, r"Microsoft\Windows\Fonts")
@@ -480,21 +516,15 @@ def task_font_cache(log):
             os.remove(f)
         except Exception:
             pass
-    try:
-        subprocess.run(["net", "start", "FontCache"], capture_output=True, timeout=20)
-    except Exception:
-        pass
+    run_hidden(["net", "start", "FontCache"], timeout=20)
     log(f"  {format_size(freed)}")
     return freed
 
 
 def task_dns_flush(log):
     log(t("opt_dns") + "...")
-    try:
-        subprocess.run(["ipconfig", "/flushdns"], capture_output=True, timeout=20)
-        log("  OK")
-    except Exception as e:
-        log(f"  {e}")
+    p = run_hidden(["ipconfig", "/flushdns"], timeout=20)
+    log("  OK" if p.returncode == 0 else f"  {p.stderr}")
     return 0
 
 
@@ -544,8 +574,6 @@ def task_registry_mru(log):
     for hive, subkey in SAFE_MRU_KEYS:
         try:
             key = winreg.OpenKey(hive, subkey, 0, winreg.KEY_ALL_ACCESS)
-        except FileNotFoundError:
-            continue
         except Exception:
             continue
         try:
@@ -581,16 +609,12 @@ UNINSTALL_PATHS = [
 
 
 def _extract_path_from_uninstall_string(s):
-    """Достаёт исполняемый путь из строки UninstallString/DisplayIcon."""
     if not s:
         return None
     s = s.strip()
     if s.startswith('"'):
         end = s.find('"', 1)
-        if end != -1:
-            return s[1:end]
-        return s[1:]
-    # без кавычек: берём первый токен до .exe
+        return s[1:end] if end != -1 else s[1:]
     m = re.search(r'([A-Za-z]:\\[^,]*?\.exe)', s, re.IGNORECASE)
     if m:
         return m.group(1)
@@ -627,8 +651,7 @@ def task_orphan_uninstall_entries(log):
                 k = winreg.OpenKey(hive, path, 0, winreg.KEY_READ)
             except Exception:
                 continue
-            uninstall_str = None
-            display_name = None
+            uninstall_str = display_name = None
             system_component = 0
             try:
                 uninstall_str, _ = winreg.QueryValueEx(k, "UninstallString")
@@ -645,7 +668,7 @@ def task_orphan_uninstall_entries(log):
             winreg.CloseKey(k)
 
             if not display_name or system_component == 1:
-                continue  # пропускаем системные компоненты и записи без имени
+                continue
             target = _extract_path_from_uninstall_string(uninstall_str)
             if target and not os.path.exists(target) and not shutil.which(os.path.basename(target) or ""):
                 try:
@@ -691,6 +714,61 @@ CLEAN_TASKS = [
     ("orphan_uninstall", task_orphan_uninstall_entries, False),
 ]
 
+# категории, для которых можно быстро оценить объём "мусора" без удаления
+SIZE_ESTIMATE_KEYS = ("temp", "wintemp", "prefetch", "wer", "thumbs", "browser", "wu")
+
+
+def estimate_sizes():
+    sizes = {}
+    local = os.environ.get("LOCALAPPDATA", "")
+
+    sizes["temp"] = sum(get_size(p) for p in
+                         set(filter(None, [os.environ.get("TEMP", ""), os.environ.get("TMP", "")])))
+    sizes["wintemp"] = get_size(r"C:\Windows\Temp")
+    sizes["prefetch"] = get_size(r"C:\Windows\Prefetch")
+    sizes["wer"] = sum(get_size(os.path.join(local, s)) for s in
+                        [r"Microsoft\Windows\WER\ReportArchive", r"Microsoft\Windows\WER\ReportQueue"])
+    thumbs_dir = os.path.join(local, r"Microsoft\Windows\Explorer")
+    sizes["thumbs"] = sum(os.path.getsize(f) for f in glob.glob(os.path.join(thumbs_dir, "thumbcache_*.db"))
+                           if os.path.exists(f)) if os.path.isdir(thumbs_dir) else 0
+    sizes["browser"] = sum(get_size(os.path.join(local, rel)) for rel in BROWSER_CACHE_PATHS.values())
+    sizes["wu"] = get_size(r"C:\Windows\SoftwareDistribution\Download")
+    return sizes
+
+
+# =============================================================================
+#  Системная информация
+# =============================================================================
+
+class MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
+
+
+def get_memory_info():
+    try:
+        m = MEMORYSTATUSEX()
+        m.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+        used_pct = m.dwMemoryLoad
+        total = m.ullTotalPhys
+        avail = m.ullAvailPhys
+        return total, avail, used_pct
+    except Exception:
+        return 0, 0, 0
+
+
+def get_os_info():
+    try:
+        return f"{platform.system()} {platform.release()} ({platform.version()})"
+    except Exception:
+        return "?"
+
 
 # =============================================================================
 #  Диски
@@ -703,7 +781,7 @@ def list_drives():
         if bitmask & (1 << i):
             letter = chr(65 + i) + ":"
             drive_type = ctypes.windll.kernel32.GetDriveTypeW(letter + "\\")
-            if drive_type == 3:  # DRIVE_FIXED
+            if drive_type == 3:
                 drives.append(letter)
     return drives
 
@@ -737,10 +815,7 @@ def optimize_drive(letter, media_type, log):
     else:
         cmd = f"Optimize-Volume -DriveLetter '{letter_only}' -Defrag -Verbose"
     rc, out, err = run_powershell(cmd, timeout=1800)
-    if rc == 0:
-        log(f"  {letter}: OK")
-    else:
-        log(f"  {letter}: {err.strip()[:200] if err else 'error'}")
+    log(f"  {letter}: OK" if rc == 0 else f"  {letter}: {err.strip()[:200] if err else 'error'}")
 
 
 # =============================================================================
@@ -756,7 +831,7 @@ RUN_KEYS = [
 
 
 def list_startup_items():
-    items = []  # dict: name, cmd, source ("HKCU Run", "HKLM Run", "Startup folder")
+    items = []
     if winreg:
         for label, hive, subkey in RUN_KEYS:
             try:
@@ -774,11 +849,12 @@ def list_startup_items():
                     break
             winreg.CloseKey(k)
 
-    for env_var, label in [("APPDATA", "Startup (user)"), ("PROGRAMDATA", "Startup (all users)")]:
+    for env_var, label, sub in [
+        ("APPDATA", "Startup (user)", r"Microsoft\Windows\Start Menu\Programs\Startup"),
+        ("PROGRAMDATA", "Startup (all users)", r"Microsoft\Windows\Start Menu\Programs\StartUp"),
+    ]:
         base = os.environ.get(env_var, "")
-        folder = os.path.join(base, r"Microsoft\Windows\Start Menu\Programs\Startup") \
-            if env_var == "APPDATA" else \
-            os.path.join(base, r"Microsoft\Windows\Start Menu\Programs\StartUp")
+        folder = os.path.join(base, sub)
         if os.path.isdir(folder):
             for f in os.listdir(folder):
                 full = os.path.join(folder, f)
@@ -824,37 +900,148 @@ def is_suspicious_startup(item):
 
 
 # =============================================================================
-#  Битые ярлыки
+#  Битые ярлыки — минимальный парсер .lnk без внешних зависимостей
 # =============================================================================
 
-def find_broken_shortcuts(log):
+def read_lnk_target(path):
+    """Извлекает целевой путь из .lnk без pywin32 (устойчиво к работе внутри exe)."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        if len(data) < 76 or data[0:4] != b"\x4c\x00\x00\x00":
+            return None
+        flags = struct.unpack("<I", data[20:24])[0]
+        offset = 76
+        has_idlist = flags & 0x1
+        has_link_info = flags & 0x2
+
+        if has_idlist:
+            if offset + 2 > len(data):
+                return None
+            idlist_size = struct.unpack("<H", data[offset:offset + 2])[0]
+            offset += 2 + idlist_size
+
+        if has_link_info:
+            li_start = offset
+            if li_start + 20 > len(data):
+                return None
+            li_flags = struct.unpack("<I", data[li_start + 8:li_start + 12])[0]
+            local_base_offset = struct.unpack("<I", data[li_start + 16:li_start + 20])[0]
+            if li_flags & 0x1 and local_base_offset:
+                start = li_start + local_base_offset
+                end = data.find(b"\x00", start)
+                if end == -1:
+                    end = len(data)
+                raw = data[start:end]
+                for enc in ("mbcs", "cp1251", "latin-1"):
+                    try:
+                        return raw.decode(enc, errors="ignore")
+                    except Exception:
+                        continue
+        return None
+    except Exception:
+        return None
+
+
+def find_broken_shortcuts():
     results = []
-    if not HAS_WIN32COM:
-        log(t("tools_shortcuts_none"))
-        return results
-    shell = win32com.client.Dispatch("WScript.Shell")
-    folders = []
     desktop = os.path.join(os.path.expanduser("~"), "Desktop")
     public_desktop = os.path.join(os.environ.get("PUBLIC", ""), "Desktop")
     start_menu = os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs")
     start_menu_all = os.path.join(os.environ.get("PROGRAMDATA", ""), r"Microsoft\Windows\Start Menu\Programs")
-    for f in [desktop, public_desktop, start_menu, start_menu_all]:
-        if os.path.isdir(f):
-            folders.append(f)
+    folders = [f for f in [desktop, public_desktop, start_menu, start_menu_all] if os.path.isdir(f)]
 
     for folder in folders:
         for dirpath, _, filenames in os.walk(folder):
             for fn in filenames:
                 if fn.lower().endswith(".lnk"):
                     full = os.path.join(dirpath, fn)
-                    try:
-                        sc = shell.CreateShortCut(full)
-                        target = sc.Targetpath
-                        if target and not os.path.exists(target):
-                            results.append({"name": fn, "path": full, "target": target})
-                    except Exception:
-                        continue
+                    target = read_lnk_target(full)
+                    if target:
+                        expanded = os.path.expandvars(target)
+                        if not os.path.exists(expanded):
+                            results.append({"name": fn, "path": full, "target": expanded})
     return results
+
+
+# =============================================================================
+#  Установленные программы
+# =============================================================================
+
+BLOATWARE_HINTS = [
+    "toolbar", "browser assistant", "coupon", "mywebsearch", "webdiscover",
+    "searchprotect", "iminent", "babylon", "ask toolbar", "conduit",
+    "driver booster", "pc optimizer", "webadvisor", "hp jumpstart",
+    "yourfreedom", "smartbar", "delta search", "wajam",
+]
+
+
+def is_bloatware(name):
+    n = (name or "").lower()
+    return any(h in n for h in BLOATWARE_HINTS)
+
+
+def list_installed_programs():
+    programs = []
+    if winreg is None:
+        return programs
+    seen = set()
+    for hive, base in UNINSTALL_PATHS:
+        try:
+            base_key = winreg.OpenKey(hive, base, 0, winreg.KEY_READ)
+        except Exception:
+            continue
+        names = []
+        i = 0
+        while True:
+            try:
+                names.append(winreg.EnumKey(base_key, i))
+                i += 1
+            except OSError:
+                break
+        winreg.CloseKey(base_key)
+
+        for name in names:
+            try:
+                k = winreg.OpenKey(hive, base + "\\" + name, 0, winreg.KEY_READ)
+            except Exception:
+                continue
+
+            def qv(val):
+                try:
+                    v, _ = winreg.QueryValueEx(k, val)
+                    return v
+                except Exception:
+                    return None
+
+            display_name = qv("DisplayName")
+            system_component = qv("SystemComponent") or 0
+            uninstall_string = qv("UninstallString")
+            publisher = qv("Publisher") or ""
+            size_kb = qv("EstimatedSize") or 0
+            winreg.CloseKey(k)
+
+            if not display_name or system_component == 1 or not uninstall_string:
+                continue
+            key_id = display_name.strip().lower()
+            if key_id in seen:
+                continue
+            seen.add(key_id)
+            programs.append({
+                "name": display_name, "publisher": publisher,
+                "size_kb": size_kb, "uninstall": uninstall_string,
+            })
+    programs.sort(key=lambda p: p["name"].lower())
+    return programs
+
+
+def uninstall_program(prog, log):
+    try:
+        subprocess.Popen(prog["uninstall"], shell=True)
+        return True
+    except Exception as e:
+        log(f"  {prog['name']}: {e}")
+        return False
 
 
 # =============================================================================
@@ -872,12 +1059,9 @@ def get_defender_status():
 
 def start_defender_scan(scan_type, log):
     log(t("security_scanning"))
-    ps = f"Start-MpScan -ScanType {scan_type}"
-    rc, out, err = run_powershell(ps, timeout=3600 if scan_type == "FullScan" else 900)
-    if rc == 0:
-        log(t("security_scan_done"))
-    else:
-        log(f"  {err.strip()[:300] if err else 'error'}")
+    rc, out, err = run_powershell(f"Start-MpScan -ScanType {scan_type}",
+                                   timeout=3600 if scan_type == "FullScan" else 900)
+    log(t("security_scan_done") if rc == 0 else f"  {err.strip()[:300] if err else 'error'}")
 
 
 # =============================================================================
@@ -888,9 +1072,11 @@ class CleanerApp:
     def __init__(self, root):
         self.root = root
         self.opts = {key: default for key, _, default in CLEAN_TASKS}
+        self.clean_checkbox_widgets = {}
         self.startup_items = []
         self.shortcut_items = []
         self.bigfile_items = []
+        self.program_items = []
         self.build_ui()
 
     # ---------------- общий каркас ----------------
@@ -900,8 +1086,8 @@ class CleanerApp:
             w.destroy()
 
         self.root.title(t("app_title", app=APP_NAME, ver=APP_VERSION, dev=DEVELOPER))
-        self.root.geometry("880x640")
-        self.root.minsize(760, 560)
+        self.root.geometry("920x680")
+        self.root.minsize(800, 580)
         self.root.configure(bg=BG)
 
         style = ttk.Style()
@@ -925,27 +1111,37 @@ class CleanerApp:
         self.tab_clean = tk.Frame(nb, bg=CARD_BG)
         self.tab_disks = tk.Frame(nb, bg=CARD_BG)
         self.tab_startup = tk.Frame(nb, bg=CARD_BG)
+        self.tab_programs = tk.Frame(nb, bg=CARD_BG)
         self.tab_security = tk.Frame(nb, bg=CARD_BG)
         self.tab_tools = tk.Frame(nb, bg=CARD_BG)
         nb.add(self.tab_clean, text=t("tab_clean"))
         nb.add(self.tab_disks, text=t("tab_disks"))
         nb.add(self.tab_startup, text=t("tab_startup"))
+        nb.add(self.tab_programs, text=t("tab_programs"))
         nb.add(self.tab_security, text=t("tab_security"))
         nb.add(self.tab_tools, text=t("tab_tools"))
 
         self._build_clean_tab()
         self._build_disks_tab()
         self._build_startup_tab()
+        self._build_programs_tab()
         self._build_security_tab()
         self._build_tools_tab()
 
     def _build_header(self):
-        header = tk.Frame(self.root, bg=ACCENT, pady=12)
+        header = tk.Frame(self.root, bg=ACCENT, pady=10)
         header.pack(fill="x")
         left = tk.Frame(header, bg=ACCENT)
         left.pack(side="left", padx=16)
         tk.Label(left, text=APP_NAME, font=("Segoe UI", 15, "bold"), bg=ACCENT, fg="white").pack(anchor="w")
-        tk.Label(left, text=f"{DEVELOPER} · v{APP_VERSION}", font=("Segoe UI", 9), bg=ACCENT, fg="#dff2e6").pack(anchor="w")
+        tk.Label(left, text=f"{DEVELOPER} · v{APP_VERSION}", font=("Segoe UI", 9),
+                 bg=ACCENT, fg="#dff2e6").pack(anchor="w")
+
+        os_info = get_os_info()
+        total, avail, load_pct = get_memory_info()
+        ram_txt = f"{t('sysinfo_os')}: {os_info}   {t('sysinfo_ram')}: {format_size(total - avail)}/{format_size(total)} ({load_pct}%)" \
+            if total else f"{t('sysinfo_os')}: {os_info}"
+        tk.Label(left, text=ram_txt, font=("Segoe UI", 8), bg=ACCENT, fg="#c9e8d3").pack(anchor="w", pady=(4, 0))
 
         right = tk.Frame(header, bg=ACCENT)
         right.pack(side="right", padx=16)
@@ -976,16 +1172,22 @@ class CleanerApp:
         top = tk.Frame(f, bg=CARD_BG)
         top.pack(fill="both", expand=True, padx=16, pady=16)
 
-        tk.Label(top, text=t("clean_what"), font=("Segoe UI", 11, "bold"), bg=CARD_BG).pack(anchor="w")
+        head_row = tk.Frame(top, bg=CARD_BG)
+        head_row.pack(fill="x")
+        tk.Label(head_row, text=t("clean_what"), font=("Segoe UI", 11, "bold"), bg=CARD_BG).pack(side="left")
+        tk.Button(head_row, text=t("sysinfo_scan"), command=self.start_size_estimate).pack(side="right")
 
         opts_frame = tk.Frame(top, bg=CARD_BG)
         opts_frame.pack(fill="x", pady=(6, 6))
         self.clean_vars = {}
+        self.clean_checkbox_widgets = {}
         for key, _, default in CLEAN_TASKS:
             v = tk.BooleanVar(value=self.opts.get(key, default))
             self.clean_vars[key] = v
-            tk.Checkbutton(opts_frame, text=t(f"opt_{key}"), variable=v, bg=CARD_BG,
-                            anchor="w", justify="left").pack(fill="x")
+            cb = tk.Checkbutton(opts_frame, text=t(f"opt_{key}"), variable=v, bg=CARD_BG,
+                                 anchor="w", justify="left")
+            cb.pack(fill="x")
+            self.clean_checkbox_widgets[key] = cb
 
         btn_row = tk.Frame(top, bg=CARD_BG)
         btn_row.pack(fill="x", pady=(4, 8))
@@ -998,7 +1200,7 @@ class CleanerApp:
         self.clean_progress = ttk.Progressbar(top, mode="indeterminate")
         self.clean_progress.pack(fill="x", pady=(0, 8))
 
-        self.clean_log = scrolledtext.ScrolledText(top, height=14, state="disabled", font=("Consolas", 9))
+        self.clean_log = scrolledtext.ScrolledText(top, height=12, state="disabled", font=("Consolas", 9))
         self.clean_log.pack(fill="both", expand=True)
 
     def _set_all_clean(self, value):
@@ -1013,6 +1215,23 @@ class CleanerApp:
             self.clean_log.configure(state="disabled")
         self.root.after(0, _write)
 
+    def start_size_estimate(self):
+        for key in SIZE_ESTIMATE_KEYS:
+            cb = self.clean_checkbox_widgets.get(key)
+            if cb:
+                cb.config(text=t(f"opt_{key}") + f" — {t('sysinfo_scanning')}")
+        threading.Thread(target=safe_thread(self._run_size_estimate, self.log_clean), daemon=True).start()
+
+    def _run_size_estimate(self):
+        sizes = estimate_sizes()
+
+        def _update():
+            for key, size in sizes.items():
+                cb = self.clean_checkbox_widgets.get(key)
+                if cb:
+                    cb.config(text=t(f"opt_{key}") + f" — {format_size(size)}")
+        self.root.after(0, _update)
+
     def start_clean(self):
         if not is_windows():
             messagebox.showerror(APP_NAME, "Windows only")
@@ -1021,7 +1240,7 @@ class CleanerApp:
             self.opts[key] = v.get()
         self.clean_start_btn.config(state="disabled")
         self.clean_progress.start(12)
-        threading.Thread(target=self._run_clean, daemon=True).start()
+        threading.Thread(target=safe_thread(self._run_clean, self.log_clean), daemon=True).start()
 
     def _run_clean(self):
         total = 0
@@ -1031,7 +1250,7 @@ class CleanerApp:
                 try:
                     total += fn(self.log_clean) or 0
                 except Exception as e:
-                    self.log_clean(f"  ERROR [{key}]: {e}")
+                    self.log_clean(f"  {t('error_prefix')} [{key}]: {e}")
             time.sleep(0.03)
         self.log_clean(t("log_done"))
         self.log_clean(t("log_freed", size=format_size(total)))
@@ -1039,8 +1258,7 @@ class CleanerApp:
         def _finish():
             self.clean_progress.stop()
             self.clean_start_btn.config(state="normal")
-            messagebox.showinfo(t("clean_finished_title"),
-                                 t("clean_finished_body", size=format_size(total)))
+            messagebox.showinfo(t("clean_finished_title"), t("clean_finished_body", size=format_size(total)))
         self.root.after(0, _finish)
 
     # ---------------- вкладка Диски ----------------
@@ -1051,14 +1269,13 @@ class CleanerApp:
         top.pack(fill="both", expand=True, padx=16, pady=16)
 
         tk.Label(top, text=t("disks_title"), font=("Segoe UI", 11, "bold"), bg=CARD_BG).pack(anchor="w")
-        tk.Label(top, text=t("disks_note"), fg=TEXT_MUTED, bg=CARD_BG, wraplength=760, justify="left").pack(anchor="w", pady=(2, 8))
+        tk.Label(top, text=t("disks_note"), fg=TEXT_MUTED, bg=CARD_BG, wraplength=780, justify="left").pack(anchor="w", pady=(2, 8))
 
-        cols = ("drive", "type", "free", "status")
+        cols = ("drive", "type", "free")
         self.disks_tree = ttk.Treeview(top, columns=cols, show="headings", height=8, selectmode="extended")
         self.disks_tree.heading("drive", text=t("disks_col_drive"))
         self.disks_tree.heading("type", text=t("disks_col_type"))
         self.disks_tree.heading("free", text=t("disks_col_free"))
-        self.disks_tree.heading("status", text=t("disks_col_status"))
         self.disks_tree.pack(fill="both", expand=True)
 
         btn_row = tk.Frame(top, bg=CARD_BG)
@@ -1074,7 +1291,7 @@ class CleanerApp:
         self.disks_log = scrolledtext.ScrolledText(top, height=8, state="disabled", font=("Consolas", 9))
         self.disks_log.pack(fill="both", expand=True)
 
-        threading.Thread(target=self.refresh_disks, daemon=True).start()
+        threading.Thread(target=safe_thread(self.refresh_disks, self.log_disks), daemon=True).start()
 
     def log_disks(self, text):
         def _write():
@@ -1094,7 +1311,7 @@ class CleanerApp:
             for i in self.disks_tree.get_children():
                 self.disks_tree.delete(i)
             for d in drives:
-                self.disks_tree.insert("", "end", iid=d, values=(d, "...", "...", ""))
+                self.disks_tree.insert("", "end", iid=d, values=(d, "...", "..."))
         self.root.after(0, _populate)
 
         for d in drives:
@@ -1103,7 +1320,7 @@ class CleanerApp:
 
             def _update(d=d, media=media, free=free):
                 if self.disks_tree.exists(d):
-                    self.disks_tree.item(d, values=(d, media, free, ""))
+                    self.disks_tree.item(d, values=(d, media, free))
             self.root.after(0, _update)
 
     def start_optimize(self, selected_only):
@@ -1118,7 +1335,7 @@ class CleanerApp:
         else:
             targets = list(self.disks_tree.get_children())
         self.disks_progress.start(12)
-        threading.Thread(target=self._run_optimize, args=(targets,), daemon=True).start()
+        threading.Thread(target=safe_thread(self._run_optimize, self.log_disks), args=(targets,), daemon=True).start()
 
     def _run_optimize(self, targets):
         for d in targets:
@@ -1138,7 +1355,7 @@ class CleanerApp:
         top.pack(fill="both", expand=True, padx=16, pady=16)
 
         tk.Label(top, text=t("startup_title"), font=("Segoe UI", 11, "bold"), bg=CARD_BG).pack(anchor="w")
-        tk.Label(top, text=t("startup_note"), fg=TEXT_MUTED, bg=CARD_BG, wraplength=760, justify="left").pack(anchor="w", pady=(2, 8))
+        tk.Label(top, text=t("startup_note"), fg=TEXT_MUTED, bg=CARD_BG, wraplength=780, justify="left").pack(anchor="w", pady=(2, 8))
 
         cols = ("name", "cmd", "source")
         self.startup_tree = ttk.Treeview(top, columns=cols, show="headings", height=12, selectmode="extended")
@@ -1158,7 +1375,10 @@ class CleanerApp:
         self.refresh_startup()
 
     def refresh_startup(self):
-        self.startup_items = list_startup_items()
+        try:
+            self.startup_items = list_startup_items()
+        except Exception:
+            self.startup_items = []
         for i in self.startup_tree.get_children():
             self.startup_tree.delete(i)
         for idx, item in enumerate(self.startup_items):
@@ -1179,6 +1399,64 @@ class CleanerApp:
             remove_startup_item(item, lambda s: None)
         self.refresh_startup()
 
+    # ---------------- вкладка Программы ----------------
+
+    def _build_programs_tab(self):
+        f = self.tab_programs
+        top = tk.Frame(f, bg=CARD_BG)
+        top.pack(fill="both", expand=True, padx=16, pady=16)
+
+        tk.Label(top, text=t("programs_title"), font=("Segoe UI", 11, "bold"), bg=CARD_BG).pack(anchor="w")
+        tk.Label(top, text=t("programs_note"), fg=TEXT_MUTED, bg=CARD_BG,
+                 wraplength=780, justify="left").pack(anchor="w", pady=(2, 8))
+
+        cols = ("name", "publisher", "size")
+        self.programs_tree = ttk.Treeview(top, columns=cols, show="headings", height=14, selectmode="extended")
+        self.programs_tree.heading("name", text=t("programs_col_name"))
+        self.programs_tree.heading("publisher", text=t("programs_col_publisher"))
+        self.programs_tree.heading("size", text=t("programs_col_size"))
+        self.programs_tree.column("name", width=340)
+        self.programs_tree.column("publisher", width=220)
+        self.programs_tree.pack(fill="both", expand=True)
+        self.programs_tree.tag_configure("bloat", foreground=DANGER)
+
+        btn_row = tk.Frame(top, bg=CARD_BG)
+        btn_row.pack(fill="x", pady=8)
+        tk.Button(btn_row, text=t("programs_refresh"), command=self.refresh_programs).pack(side="left")
+        ttk.Button(btn_row, text=t("programs_uninstall"), style="Accent.TButton",
+                   command=self.uninstall_programs_selected).pack(side="right")
+
+        threading.Thread(target=safe_thread(self.refresh_programs, None), daemon=True).start()
+
+    def refresh_programs(self):
+        try:
+            items = list_installed_programs()
+        except Exception:
+            items = []
+        self.program_items = items
+
+        def _populate():
+            for i in self.programs_tree.get_children():
+                self.programs_tree.delete(i)
+            for idx, p in enumerate(items):
+                size_txt = format_size(p["size_kb"] * 1024) if p["size_kb"] else "—"
+                tag = "bloat" if is_bloatware(p["name"]) else ""
+                self.programs_tree.insert("", "end", iid=str(idx),
+                                          values=(p["name"], p["publisher"], size_txt),
+                                          tags=(tag,) if tag else ())
+        self.root.after(0, _populate)
+
+    def uninstall_programs_selected(self):
+        sel = self.programs_tree.selection()
+        if not sel:
+            messagebox.showinfo(APP_NAME, t("nothing_selected"))
+            return
+        if not messagebox.askyesno(t("confirm_delete_title"), t("programs_confirm", n=len(sel))):
+            return
+        for iid in sel:
+            prog = self.program_items[int(iid)]
+            uninstall_program(prog, lambda s: None)
+
     # ---------------- вкладка Безопасность ----------------
 
     def _build_security_tab(self):
@@ -1188,7 +1466,7 @@ class CleanerApp:
 
         tk.Label(top, text=t("security_title"), font=("Segoe UI", 11, "bold"), bg=CARD_BG).pack(anchor="w")
         tk.Label(top, text=t("security_disclaimer"), fg=TEXT_MUTED, bg=CARD_BG,
-                 wraplength=760, justify="left").pack(anchor="w", pady=(2, 10))
+                 wraplength=780, justify="left").pack(anchor="w", pady=(2, 10))
 
         status_row = tk.Frame(top, bg=CARD_BG)
         status_row.pack(fill="x", pady=(0, 10))
@@ -1210,7 +1488,7 @@ class CleanerApp:
         self.security_log = scrolledtext.ScrolledText(top, height=10, state="disabled", font=("Consolas", 9))
         self.security_log.pack(fill="both", expand=True)
 
-        threading.Thread(target=self._load_defender_status, daemon=True).start()
+        threading.Thread(target=safe_thread(self._load_defender_status, None), daemon=True).start()
 
     def log_security(self, text):
         def _write():
@@ -1232,7 +1510,7 @@ class CleanerApp:
             messagebox.showwarning(APP_NAME, t("admin_required"))
             return
         self.security_progress.start(12)
-        threading.Thread(target=self._run_scan, args=(scan_type,), daemon=True).start()
+        threading.Thread(target=safe_thread(self._run_scan, self.log_security), args=(scan_type,), daemon=True).start()
 
     def _run_scan(self, scan_type):
         start_defender_scan(scan_type, self.log_security)
@@ -1255,7 +1533,6 @@ class CleanerApp:
         top = tk.Frame(f, bg=CARD_BG)
         top.pack(fill="both", expand=True, padx=16, pady=16)
 
-        # -- битые ярлыки --
         tk.Label(top, text=t("tools_shortcuts"), font=("Segoe UI", 11, "bold"), bg=CARD_BG).pack(anchor="w")
         sc_cols = ("name", "target")
         self.shortcuts_tree = ttk.Treeview(top, columns=sc_cols, show="headings", height=6, selectmode="extended")
@@ -1271,7 +1548,6 @@ class CleanerApp:
 
         ttk.Separator(top, orient="horizontal").pack(fill="x", pady=8)
 
-        # -- большие файлы --
         tk.Label(top, text=t("tools_bigfiles"), font=("Segoe UI", 11, "bold"), bg=CARD_BG).pack(anchor="w", pady=(4, 4))
         row = tk.Frame(top, bg=CARD_BG)
         row.pack(fill="x")
@@ -1300,15 +1576,15 @@ class CleanerApp:
             self.bigfiles_folder_var.set(d)
 
     def scan_shortcuts(self):
-        threading.Thread(target=self._run_scan_shortcuts, daemon=True).start()
+        for i in self.shortcuts_tree.get_children():
+            self.shortcuts_tree.delete(i)
+        threading.Thread(target=safe_thread(self._run_scan_shortcuts, None), daemon=True).start()
 
     def _run_scan_shortcuts(self):
-        results = find_broken_shortcuts(lambda s: None)
+        results = find_broken_shortcuts()
         self.shortcut_items = results
 
         def _populate():
-            for i in self.shortcuts_tree.get_children():
-                self.shortcuts_tree.delete(i)
             for idx, r in enumerate(results):
                 self.shortcuts_tree.insert("", "end", iid=str(idx), values=(r["name"], r["target"]))
         self.root.after(0, _populate)
@@ -1334,7 +1610,9 @@ class CleanerApp:
             min_mb = float(self.bigfiles_minsize_var.get())
         except ValueError:
             min_mb = 200
-        threading.Thread(target=self._run_scan_bigfiles, args=(folder, min_mb), daemon=True).start()
+        for i in self.bigfiles_tree.get_children():
+            self.bigfiles_tree.delete(i)
+        threading.Thread(target=safe_thread(self._run_scan_bigfiles, None), args=(folder, min_mb), daemon=True).start()
 
     def _run_scan_bigfiles(self, folder, min_mb):
         min_bytes = min_mb * 1024 * 1024
@@ -1353,8 +1631,6 @@ class CleanerApp:
         self.bigfile_items = results
 
         def _populate():
-            for i in self.bigfiles_tree.get_children():
-                self.bigfiles_tree.delete(i)
             for idx, (path, size) in enumerate(results):
                 self.bigfiles_tree.insert("", "end", iid=str(idx), values=(path, format_size(size)))
         self.root.after(0, _populate)
