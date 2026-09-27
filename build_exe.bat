@@ -16,14 +16,15 @@ if errorlevel 1 (
 )
 
 echo.
-echo Установка PyInstaller и pywin32 (если ещё не установлены)...
-python -m pip install --upgrade pyinstaller pywin32
+echo Установка PyInstaller (если ещё не установлен)...
+python -m pip install --upgrade pyinstaller
 
 echo.
 echo Сборка EXE...
 python -m PyInstaller --onefile --windowed ^
     --name "PYSHOK_Cleaner" ^
     --version-file "version_info.txt" ^
+    --icon "icon.ico" ^
     cleaner.py
 
 echo.
