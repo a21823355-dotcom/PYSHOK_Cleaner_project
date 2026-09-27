@@ -19,14 +19,15 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Установить PyInstaller и pywin32
-        run: python -m pip install --upgrade pip pyinstaller pywin32
+      - name: Установить PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
 
       - name: Собрать EXE
         run: >
           python -m PyInstaller --onefile --windowed
           --name "PYSHOK_Cleaner"
           --version-file "version_info.txt"
+          --icon "icon.ico"
           cleaner.py
 
       - name: Загрузить готовый EXE как артефакт
